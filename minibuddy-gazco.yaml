@@ -1,0 +1,640 @@
+packages:
+  base: !include _base.yaml
+
+substitutions:
+  device_name: minibuddy-gazco-control
+  friendly_name: Mini Buddy - Gazco Fire Control
+  wifi_ip_address: 192.168.0.177  # Adjust as needed
+  release_version: '1.3'
+
+web_server:
+  version: 3
+
+esphome:
+
+esp32:
+  board: ttgo-lora32-v21
+  variant: ESP32
+  framework:
+    type: esp-idf
+
+logger:
+  level: debug
+  logs:
+    homeassistant.sensor: WARN
+    sensor: WARN
+    text_sensor: WARN
+
+spi:
+  id: radio_spi
+  clk_pin: GPIO5
+  mosi_pin: GPIO27
+  miso_pin: GPIO19
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 400kHz
+
+# ================================================================================
+# HARDWARE SWITCHES
+# ================================================================================
+switch:
+  - platform: template
+    name: "ESP32 - Display Status"
+    id: display_enabled
+    icon: mdi:monitor
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+
+  - platform: gpio
+    name: "ESP32 - Green LED"
+    pin: GPIO25
+    id: led_switch
+    icon: mdi:lightbulb
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "Gazco - LED Display"
+    id: led_display
+    icon: mdi:fire
+    restore_mode: RESTORE_DEFAULT_OFF
+    optimistic: true
+
+# ================================================================================
+# GAZCO FIRE CONTROLS
+# ================================================================================
+# LED Display: On/Off (independent of heater)
+# Heater: Off, Low, High (independent of LED)
+# Flame Colour: 1-3
+# Flame Brightness: Off, 1-5
+# Fuel Bed Colour: 1-13, Cycle
+# Fuel Bed Brightness: Off, 1-5
+# ================================================================================
+select:
+  - platform: template
+    name: "Gazco - Heater"
+    id: heater_select
+    icon: mdi:radiator
+    optimistic: true
+    options:
+      - "Off"
+      - "Low"
+      - "High"
+    initial_option: "Off"
+    restore_value: true
+
+  - platform: template
+    name: "Gazco - Flame Colour"
+    id: flame_colour_select
+    icon: mdi:palette
+    optimistic: true
+    options:
+      - "1"
+      - "2"
+      - "3"
+    initial_option: "2"
+    restore_value: true
+
+  - platform: template
+    name: "Gazco - Flame Brightness"
+    id: flame_brightness_select
+    icon: mdi:brightness-6
+    optimistic: true
+    options:
+      - "Off"
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    initial_option: "4"
+    restore_value: true
+
+  - platform: template
+    name: "Gazco - Fuel Bed Colour"
+    id: fuel_colour_select
+    icon: mdi:palette-outline
+    optimistic: true
+    options:
+      - "White"
+      - "Red"
+      - "Amber"
+      - "Yellow"
+      - "Lime"
+      - "Green"
+      - "Cyan"
+      - "Sky Blue"
+      - "Blue"
+      - "Lavender"
+      - "Magenta"
+      - "Bright Pink"
+      - "Deep Pink"
+      - "Cycle"
+    initial_option: "Green"
+    restore_value: true
+
+  - platform: template
+    name: "Gazco - Fuel Bed Brightness"
+    id: fuel_brightness_select
+    icon: mdi:brightness-4
+    optimistic: true
+    options:
+      - "Off"
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    initial_option: "5"
+    restore_value: true
+
+  # Receiver debug level: controls how much RX output is shown
+  - platform: template
+    name: "Gazco - Debug Level"
+    id: debug_level
+    icon: mdi:bug
+    optimistic: true
+    options:
+      - "Valid Only"
+      - "All Packets"
+      - "Verbose"
+    initial_option: "Valid Only"
+    restore_value: true
+    entity_category: "diagnostic"
+
+# ================================================================================
+# UNIT ID — Set this to match your fire's remote
+# ================================================================================
+# To learn the Unit ID from your real remote:
+#   1. Set Debug Level to "All Packets" or "Verbose"
+#   2. Press a button on the real remote near the antenna
+#   3. Read the ID from the receiver log (e.g. ID:0x0FD0)
+#   4. Enter it here as a 4-character hex string (e.g. "0FD0")
+# The value is persisted across reboots.
+# ================================================================================
+text:
+  - platform: template
+    name: "Gazco - Unit ID"
+    id: unit_id_text
+    icon: mdi:identifier
+    optimistic: true
+    min_length: 4
+    max_length: 4
+    initial_value: "0FD0"
+    restore_value: true
+    mode: text
+    entity_category: "config"
+
+# Main control button
+button:
+  - platform: template
+    name: "Gazco - Send Command"
+    icon: mdi:send
+    on_press:
+      - lambda: |-
+          // ==========================================
+          // GAZCO RF TRANSMITTER
+          // ==========================================
+          // Packet (64 bits): [Preamble x10] [ID 16b] [B0-B3] [CHK] [~CHK]
+          //   B0 = ((Cmd*8 + FC) << 3) | FB
+          //   B1 = UC + 16
+          //   B2 = (UB << 2) | HL
+          //   B3 = 0x00
+          //   B4 = (sum of all 6 bytes + 0x55) & 0xFF
+          //   B5 = ~B4
+          // ==========================================
+
+          // --- Parse Unit ID from hex text input ---
+          std::string uid_str = id(unit_id_text).state;
+          uint16_t unit_id = 0;
+          if (uid_str.length() == 4) {
+            unit_id = (uint16_t)strtoul(uid_str.c_str(), nullptr, 16);
+          }
+          uint8_t unit_hi = (unit_id >> 8) & 0xFF;
+          uint8_t unit_lo = unit_id & 0xFF;
+
+          // --- Read LED and Heater settings (independent controls) ---
+          bool led_on = id(led_display).state;
+          static const std::map<std::string, int> heater_map = {
+            {"Off", 0}, {"Low", 1}, {"High", 2}
+          };
+          int heater_level = 0;
+          auto it_hl = heater_map.find(id(heater_select).current_option());
+          if (it_hl != heater_map.end()) heater_level = it_hl->second;
+
+          // Cmd: bit0 = LED on, bit1 = heater enabled
+          int cmd = 0;
+          if (led_on) cmd |= 1;
+          if (heater_level > 0) cmd |= 2;
+
+          // --- Read flame/fuel settings ---
+          int flame_col = atoi(id(flame_colour_select).current_option().c_str());
+          if (flame_col < 1 || flame_col > 3) flame_col = 2;
+
+          std::string fb_str = id(flame_brightness_select).current_option();
+          int flame_bright = (fb_str == "Off") ? 0 : atoi(fb_str.c_str());
+
+          int fuel_col = 6;
+          std::string uc_str = id(fuel_colour_select).current_option();
+          static const std::map<std::string, int> fuel_colour_map = {
+            {"White", 1}, {"Red", 2}, {"Amber", 3}, {"Yellow", 4},
+            {"Lime", 5}, {"Green", 6}, {"Cyan", 7}, {"Sky Blue", 8},
+            {"Blue", 9}, {"Lavender", 10}, {"Magenta", 11},
+            {"Bright Pink", 12}, {"Deep Pink", 13}, {"Cycle", 14}
+          };
+          auto it_fc = fuel_colour_map.find(uc_str);
+          if (it_fc != fuel_colour_map.end()) fuel_col = it_fc->second;
+
+          std::string ub_str = id(fuel_brightness_select).current_option();
+          int fuel_bright = (ub_str == "Off") ? 0 : atoi(ub_str.c_str());
+
+          // --- Build packet bytes ---
+          int b0 = ((cmd * 8 + flame_col) << 3) | flame_bright;
+          int b1 = fuel_col + 16;
+          int b2 = (fuel_bright << 2) | heater_level;
+          int b3 = 0x00;
+          int b4 = (unit_hi + unit_lo + b0 + b1 + b2 + b3 + 0x55) & 0xFF;
+          int b5 = (~b4) & 0xFF;
+
+          ESP_LOGI("gazco", "========== TRANSMITTING ==========");
+          ESP_LOGI("gazco", "LED:%s Htr:%s(HL=%d) FC=%d FB=%d UC=%d UB=%d",
+                   led_on ? "On" : "Off",
+                   heater_level > 0 ? (heater_level == 1 ? "Low" : "High") : "Off",
+                   heater_level, flame_col, flame_bright, fuel_col, fuel_bright);
+          ESP_LOGI("gazco", "Packet: ID:%02X%02X B0:%02X B1:%02X B2:%02X B3:%02X CHK:%02X ~%02X",
+                   unit_hi, unit_lo, b0, b1, b2, b3, b4, b5);
+
+          uint8_t packet[8] = {
+            (uint8_t)unit_hi, (uint8_t)unit_lo,
+            (uint8_t)b0, (uint8_t)b1, (uint8_t)b2, (uint8_t)b3,
+            (uint8_t)b4, (uint8_t)b5
+          };
+
+          // --- Timing (averaged from real remote captures) ---
+          const int PREAMBLE_MARK = 480;
+          const int SPACE_WIDTH = 470;
+          const int DATA_0_MARK = 280;
+          const int DATA_1_MARK = 670;
+          const int PREAMBLE_COUNT = 10;
+          const int INTER_PACKET_GAP = 10000;
+          const int TX_REPEATS = 6;
+
+          auto transmit = id(tx_id).transmit();
+          auto data = transmit.get_data();
+          data->set_carrier_frequency(0);
+
+          for (int rep = 0; rep < TX_REPEATS; rep++) {
+            for (int p = 0; p < PREAMBLE_COUNT; p++) {
+              data->mark(PREAMBLE_MARK);
+              data->space(SPACE_WIDTH);
+            }
+            for (int byte_idx = 0; byte_idx < 8; byte_idx++) {
+              for (int bit = 7; bit >= 0; bit--) {
+                if ((packet[byte_idx] >> bit) & 1) {
+                  data->mark(DATA_1_MARK);
+                } else {
+                  data->mark(DATA_0_MARK);
+                }
+                data->space(SPACE_WIDTH);
+              }
+            }
+            if (rep < TX_REPEATS - 1) {
+              data->space(INTER_PACKET_GAP);
+            }
+          }
+
+          transmit.perform();
+          ESP_LOGI("gazco", "Transmission complete (%d repeats)", TX_REPEATS);
+
+# ================================================================================
+# OLED DISPLAY
+# ================================================================================
+font:
+  - file: 'calibril.ttf'
+    id: font1
+    size: 10
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: oled_display
+    update_interval: 2s
+    lambda: |-
+      if (id(display_enabled).state) {
+        it.print(0, 0, font1, "${friendly_name} - ${release_version}");
+        if (id(last_packet_received).state != "") {
+          it.printf(0, 12, font1, "Last: %s", id(last_packet_received).state.c_str());
+        } else {
+          it.print(0, 12, font1, "Last: N/A");
+        }
+        it.printf(0, 24, font1, "Count: %d", id(packet_count_gl));
+        it.printf(0, 36, font1, "Freq: 433.92 MHz");
+        it.printf(0, 48, font1, "Mode: Gazco OOK");
+      } else {
+        it.fill(Color::BLACK);
+      }
+
+# ================================================================================
+# SX127x RADIO — 433.92MHz OOK
+# ================================================================================
+sx127x:
+  spi_id: radio_spi
+  cs_pin: GPIO18
+  rst_pin: GPIO23
+  frequency: 433920000
+  modulation: OOK
+  packet_mode: false
+  rx_start: true
+  rx_floor: -100
+  bandwidth: 200_0kHz
+  pa_pin: BOOST
+  pa_power: 17
+  bitsync: false
+  shaping: NONE
+  auto_cal: false
+
+# ================================================================================
+# DIAGNOSTIC SENSORS
+# ================================================================================
+text_sensor:
+  - platform: template
+    device_class: timestamp
+    id: last_packet_received
+    name: "Gazco - Last Packet Received"
+    entity_category: "diagnostic"
+
+sensor:
+  - platform: template
+    name: Gazco - Packet Count
+    id: packet_count
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      return (float) id(packet_count_gl);
+    disabled_by_default: true
+    entity_category: "diagnostic"
+
+# ================================================================================
+# RF PROTOCOL REFERENCE
+# ================================================================================
+# Encoding: Mark-width PWM at 433.92MHz OOK (spaces are constant ~470us)
+#   Preamble mark: ~480us, Data '0': ~280us, Data '1': ~670us
+#
+# Packet (64 bits):
+#   [Preamble x10] [Unit ID 16b] [B0] [B1] [B2] [B3] [CHK] [~CHK]
+#
+# Byte encoding:
+#   B0 = ((Cmd*8 + FC) << 3) | FB
+#     Cmd: bit0=LED, bit1=Heater (0=off, 1=LED, 2=heat only, 3=both)
+#     FC:  Flame Colour (1-3)
+#     FB:  Flame Brightness (0=Off, 1-5)
+#   B1 = UC + 16  (Fuel Colour: 1-13, 14=Cycle)
+#   B2 = (UB << 2) | HL
+#     UB: Fuel Brightness (0=Off, 1-5)
+#     HL: Heater Level (0=Off, 1=Low, 2=High)
+#   B3 = 0x00
+#   B4 = (ID_hi + ID_lo + B0 + B1 + B2 + B3 + 0x55) & 0xFF
+#   B5 = ~B4 & 0xFF
+# ================================================================================
+
+# ================================================================================
+# RECEIVER — Decodes Gazco RF packets from 433MHz
+# ================================================================================
+# Use this to listen to the real remote and learn its Unit ID.
+# Set Debug Level to "All Packets" or "Verbose", press a button on the
+# real remote, and read the Unit ID from the log output.
+# ================================================================================
+remote_receiver:
+  id: rx_id
+  pin:
+    number: GPIO32
+    allow_other_uses: true
+  dump: []
+  tolerance: 30%
+  filter: 100us
+  idle: 10ms
+  buffer_size: 20kB
+  on_raw:
+    then:
+      - lambda: |-
+          // ==========================================
+          // GAZCO RF RECEIVER — Mark-width decoder
+          // ==========================================
+          // Mark width thresholds (from real remote captures):
+          //   Preamble: 333-507us  -> >= 320us
+          //   Data '0': 120-307us  -> < 450us
+          //   Data '1': 560-707us  -> >= 450us
+          // ==========================================
+
+          const int MIN_PULSES = 60;
+          const int MAX_PULSE = 2000;
+          const int PREAMBLE_THRESH = 320;
+          const int DATA_THRESH = 450;
+
+          if (x.size() < MIN_PULSES) return;
+
+          // Read debug level once
+          std::string dbg = id(debug_level).current_option();
+          bool verbose = (dbg == "Verbose");
+          bool valid_only = (dbg == "Valid Only");
+
+          // ---- Verbose: raw pulse dump ----
+          if (verbose) {
+            ESP_LOGI("gazco", "=== RAW PULSES (%d) ===", x.size());
+            for (size_t i = 0; i < x.size(); i += 30) {
+              std::string chunk = "";
+              size_t end = std::min(i + 30, x.size());
+              for (size_t j = i; j < end; j++) {
+                char buf[10];
+                sprintf(buf, "%d,", x[j]);
+                chunk += buf;
+              }
+              if (!chunk.empty()) chunk.pop_back();
+              ESP_LOGI("gazco", "  [%d-%d]: %s", i, end-1, chunk.c_str());
+            }
+          }
+
+          // ---- Find preamble end ----
+          int preamble_count = 0;
+          size_t data_start = 0;
+
+          for (size_t i = 0; i + 1 < x.size(); i += 2) {
+            int mark = abs(x[i]);
+            int space = abs(x[i + 1]);
+            if (mark > MAX_PULSE || space > MAX_PULSE) continue;
+
+            if (mark >= PREAMBLE_THRESH) {
+              preamble_count++;
+            } else {
+              data_start = i;
+              break;
+            }
+          }
+
+          // ---- Decode data bits ----
+          std::string bits = "";
+          std::string verbose_pairs = "";
+
+          for (size_t i = data_start; i + 1 < x.size(); i += 2) {
+            int mark = abs(x[i]);
+            int space = abs(x[i + 1]);
+            if (mark > MAX_PULSE || space > MAX_PULSE) continue;
+
+            char bit_ch = (mark >= DATA_THRESH) ? '1' : '0';
+            bits += bit_ch;
+
+            if (bits.length() <= 20 && verbose) {
+              char dbuf[24];
+              sprintf(dbuf, "[%d,%d]=%c ", mark, space, bit_ch);
+              verbose_pairs += dbuf;
+            }
+          }
+
+          if (verbose) {
+            ESP_LOGI("gazco", "First 20 data pairs: %s", verbose_pairs.c_str());
+          }
+
+          // ---- Extract Unit ID from first 16 bits ----
+          std::string id_str = "????";
+          int id_val = 0;
+          if (bits.length() >= 16) {
+            std::string id_bits = bits.substr(0, 16);
+            id_val = (int)strtoul(id_bits.c_str(), nullptr, 2);
+            char uid_buf[8];
+            sprintf(uid_buf, "%04X", id_val);
+            id_str = uid_buf;
+          }
+
+          // ---- Quality indicator ----
+          const char* quality = "OK";
+          if (bits.length() < 46) quality = "SHORT";
+          else if (bits.length() > 66) quality = "LONG";
+
+          // ---- Extract payload bytes (after 16-bit Unit ID) ----
+          int pb[8] = {0};
+          int pb_count = 0;
+          for (size_t i = 16; i < bits.length() && pb_count < 8; i += 8) {
+            size_t avail = std::min((size_t)8, bits.length() - i);
+            std::string byte_bits = bits.substr(i, avail);
+            if (avail < 8) byte_bits.append(8 - avail, '0');
+            pb[pb_count++] = (int)strtoul(byte_bits.c_str(), nullptr, 2);
+          }
+
+          // ---- Checksum verification ----
+          bool chk_ok = false;
+          if (pb_count >= 5) {
+            int expected = ((id_val >> 8) + (id_val & 0xFF)
+                + pb[0] + pb[1] + pb[2] + pb[3] + 0x55) & 0xFF;
+            chk_ok = (pb[4] == expected);
+          }
+
+          // ---- Filter: skip invalid packets if "Valid Only" ----
+          if (valid_only && !chk_ok) return;
+
+          // ---- Increment counter ----
+          id(packet_count_gl)++;
+          int pkt_num = id(packet_count_gl);
+          id(packet_count).publish_state(pkt_num);
+
+          // ---- Log packet summary ----
+          char summary[200];
+          sprintf(summary, "PKT#%d [%s] | ID:0x%s | P:%d | %d bits | B0:%02X B1:%02X B2:%02X B3:%02X",
+                  pkt_num, quality, id_str.c_str(), preamble_count,
+                  (int)bits.length(), pb[0], pb[1], pb[2], pb[3]);
+          std::string extra = "";
+          for (int i = 4; i < pb_count; i++) {
+            char ebuf[12];
+            sprintf(ebuf, " B%d:%02X", i, pb[i]);
+            extra += ebuf;
+          }
+          ESP_LOGI("gazco", "%s%s", summary, extra.c_str());
+
+          // ---- Decode protocol fields ----
+          if (pb_count >= 4) {
+            int flame_bright = (pb[0] & 0x07);
+            int cmd_fc = (pb[0] >> 3);
+            int cmd = (cmd_fc >> 3);
+            int flame_col = (cmd_fc & 0x07);
+
+            int fuel_col = pb[1] - 16;
+            int fuel_bright = pb[2] >> 2;
+            int heater_level = pb[2] & 0x03;
+
+            bool led_on = (cmd & 1) != 0;
+            bool htr_on = (cmd & 2) != 0;
+            const char* hl_names[] = {"Off", "Low", "High"};
+            const char* hl_disp = (heater_level <= 2) ? hl_names[heater_level] : "???";
+
+            static const std::map<int, const char*> fuel_colour_names = {
+              {1,"Wht"}, {2,"Red"}, {3,"Amb"}, {4,"Yel"}, {5,"Lim"},
+              {6,"Grn"}, {7,"Cyn"}, {8,"Sky"}, {9,"Blu"}, {10,"Lav"},
+              {11,"Mag"}, {12,"BPk"}, {13,"DPk"}, {14,"Cycle"}
+            };
+            char uc_disp[8];
+            auto it_uc = fuel_colour_names.find(fuel_col);
+            snprintf(uc_disp, sizeof(uc_disp), "%s",
+                     it_uc != fuel_colour_names.end() ? it_uc->second : "???");
+
+            char fb_disp[4], ub_disp[4];
+            if (flame_bright) snprintf(fb_disp, sizeof(fb_disp), "%d", flame_bright); else strcpy(fb_disp, "Off");
+            if (fuel_bright) snprintf(ub_disp, sizeof(ub_disp), "%d", fuel_bright); else strcpy(ub_disp, "Off");
+
+            ESP_LOGI("gazco", "  >> LED:%s Htr:%s FC=%d FB=%s UC=%s UB=%s%s",
+                     led_on ? "On" : "Off", htr_on ? hl_disp : "Off",
+                     flame_col, fb_disp, uc_disp, ub_disp,
+                     chk_ok ? " CHK:OK" : (pb_count >= 5 ? " CHK:FAIL" : ""));
+          }
+
+          // ---- Verbose: binary dump ----
+          if (verbose) {
+            if (bits.length() > 16) {
+              ESP_LOGI("gazco", "  Binary: %s | %s", bits.substr(0, 16).c_str(), bits.substr(16).c_str());
+            } else {
+              ESP_LOGI("gazco", "  Binary: %s", bits.c_str());
+            }
+          }
+
+          // ---- Update timestamp ----
+          auto time = id(sntp_time).now();
+          if (time.is_valid()) {
+            id(last_packet_received).publish_state(time.strftime("%H:%M:%S"));
+          } else {
+            id(last_packet_received).publish_state("--:--:--");
+          }
+
+# ================================================================================
+# TRANSMITTER — Half-duplex on GPIO32 (shared with receiver)
+# ================================================================================
+remote_transmitter:
+  id: tx_id
+  non_blocking: true
+  pin:
+    number: GPIO32
+    mode:
+      input: true
+      output: true
+      pullup: true
+      open_drain: true
+    allow_other_uses: true
+  carrier_duty_percent: 100%
+  on_transmit:
+    then:
+      - sx127x.set_mode_standby
+      - remote_transmitter.digital_write: false
+      - sx127x.set_mode_tx
+  on_complete:
+    then:
+      - sx127x.set_mode_standby
+      - remote_transmitter.digital_write: true
+      - sx127x.set_mode_rx
+
+# ================================================================================
+# GLOBALS — packet counter only (not persisted, resets on boot)
+# ================================================================================
+globals:
+  - id: packet_count_gl
+    type: int
+    restore_value: false
+    initial_value: '0'

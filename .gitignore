@@ -1,0 +1,27 @@
+# Secrets - NEVER commit
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
